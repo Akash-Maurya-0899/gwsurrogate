@@ -5,6 +5,10 @@ description = "An easy to use interface to gravitational wave surrogate models"
 readme = "README.md"
 dynamic = ["version", "license", "authors", "dependencies", "entry-points", "classifiers"]
 
+[project.optional-dependencies]
+# Optional JAX backend for the NRSur7dq4 surrogate (gwsurrogate.jax)
+jax = ["jax>=0.4.30"]
+
 [build-system]
     requires = [
         "setuptools>=61.0",
