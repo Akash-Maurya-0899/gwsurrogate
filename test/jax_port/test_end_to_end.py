@@ -157,8 +157,13 @@ def test_batch_matches_single(jax_surrogate):
 def test_unsupported_options_raise(jax_surrogate):
     with pytest.raises(NotImplementedError):
         jax_surrogate(2.0, np.zeros(3), np.zeros(3), f_low=0.001)
-    with pytest.raises(NotImplementedError):
-        jax_surrogate(2.0, np.zeros(3), np.zeros(3), f_low=0.0, f_ref=0.01)
+    with pytest.raises(ValueError):
+        # f_ref far above omega_ref_max/pi
+        jax_surrogate(2.0, np.zeros(3), np.zeros(3), f_low=0.0, f_ref=0.5)
+    with pytest.raises(ValueError):
+        # f_ref below the frequency at the first node
+        jax_surrogate(2.0, np.zeros(3), np.zeros(3), f_low=0.0,
+                      f_ref=1e-4)
     with pytest.raises(ValueError):
         jax_surrogate(0.5, np.zeros(3), np.zeros(3), f_low=0.0)
     with pytest.raises(ValueError):
