@@ -273,23 +273,55 @@ class NRSur7dq4JAX:
             return times
         return None
 
-    def __call__(self, q, chiA0, chiB0, f_low=None, f_ref=None, dt=None,
-                 times=None, ellMax=None, precessing_opts=None):
-        """Evaluate dimensionless inertial-frame modes h_lm(t).
+    def __call__(self, q, chiA0, chiB0, M=None, dist_mpc=None, f_low=None,
+                 f_ref=None, dt=None, times=None, ellMax=None,
+                 inclination=None, phi_ref=0, precessing_opts=None,
+                 units="dimensionless"):
+        """Evaluate inertial-frame modes h_lm(t) (or the summed strain).
 
-        Arguments mirror the dimensionless subset of
-        ``SurrogateEvaluator.__call__`` (gwsurrogate/surrogate.py:1721):
-        q, chiA0, chiB0 are the mass ratio and reference-epoch spins
-        (lalsimulation conventions); f_low must be 0/None for now; f_ref
-        is the reference frequency (cycles/M) at which the frame and spins
-        are defined (None/0 = start of the surrogate data); dt or times
-        select an output grid (default: the coorbital grid); ellMax limits
-        the modes; precessing_opts supports 'init_orbphase', 'init_quat'
-        and 'return_dynamics'.
+        Arguments mirror ``SurrogateEvaluator.__call__``
+        (gwsurrogate/surrogate.py:1721): q, chiA0, chiB0 are the mass
+        ratio and reference-epoch spins (lalsimulation conventions);
+        f_low must be 0/None for now; f_ref is the reference frequency at
+        which the frame and spins are defined (None/0 = start of the
+        surrogate data); dt or times select an output grid (default: the
+        coorbital grid); ellMax limits the modes; precessing_opts supports
+        'init_orbphase', 'init_quat' and 'return_dynamics'.
+
+        With units='mks', specify both M (solar masses) and dist_mpc;
+        f_low/f_ref are then in Hz and dt/times in seconds, and the
+        returned strain is physically scaled. With inclination not None,
+        the modes are summed at (inclination, pi/2 - phi_ref) following
+        the LAL convention and a single complex strain is returned in
+        place of the mode dict.
 
         Returns (times, h, dynamics) where h maps (ell, m) -> complex
-        time series and dynamics is None unless return_dynamics is set.
+        time series (or is the summed strain) and dynamics is None unless
+        return_dynamics is set.
         """
+        # Unit scalings (SurrogateEvaluator.__call__ :2039-2062).
+        if (M is None) ^ (dist_mpc is None):
+            raise ValueError("Either specify both M and dist_mpc, or "
+                             "neither")
+        if (M is not None) ^ (units == "mks"):
+            raise ValueError("M/dist_mpc must be specified if and only if "
+                             "units='mks'")
+        if units == "dimensionless":
+            amp_scale = 1.0
+            t_scale = 1.0
+        elif units == "mks":
+            import gwtools as _gwtools
+            amp_scale = M * _gwtools.Msuninsec * _gwtools.c \
+                / (1e6 * dist_mpc * _gwtools.PC_SI)
+            t_scale = _gwtools.Msuninsec * M
+        else:
+            raise ValueError("Invalid units")
+
+        f_low = None if f_low is None else f_low * t_scale
+        f_ref = None if f_ref is None else f_ref * t_scale
+        dt = None if dt is None else dt / t_scale
+        times = None if times is None else np.asarray(times) / t_scale
+
         precessing_opts = dict(precessing_opts or {})
         init_orbphase = precessing_opts.pop("init_orbphase", 0.0) or 0.0
         init_quat = precessing_opts.pop("init_quat", None)
@@ -360,6 +392,24 @@ class NRSur7dq4JAX:
                 "q_copr": np.asarray(quat),
                 "orbphase": np.asarray(orbphase),
             }
+
+        # Mode sum at (inclination, pi/2 - phi_ref), LAL convention
+        # (SurrogateEvaluator.__call__ :2085; _mode_sum :1704 — precessing
+        # models carry all m modes, no faked negative modes).
+        if inclination is not None:
+            from gwtools.harmonics import sYlm as _sYlm
+            theta = inclination
+            phi = np.pi / 2 - phi_ref
+            h = sum(_sYlm(-2, ell, m, theta, phi) * h_mode
+                    for (ell, m), h_mode in h.items())
+
+        # Rescale to physical units (:2102, :2124).
+        output_times = output_times * t_scale
+        if amp_scale != 1:
+            if isinstance(h, dict):
+                h = {mode: series * amp_scale for mode, series in h.items()}
+            else:
+                h = h * amp_scale
 
         return output_times, h, dynamics
 

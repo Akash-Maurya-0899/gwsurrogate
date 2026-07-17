@@ -195,6 +195,37 @@ Jupyter notebooks located in
 give a more comprehensive overview of individual models.
 
 
+## JAX implementation of NRSur7dq4 (experimental)
+
+An optional [JAX](https://jax.readthedocs.io) implementation of the
+NRSur7dq4 model lives in `gwsurrogate.jax`, providing JIT compilation,
+`vmap` batching over intrinsic parameters, hardware-agnostic (CPU/GPU)
+execution, and differentiable waveforms. Install the extra dependency with
+`pip install gwsurrogate[jax]`. Importing `gwsurrogate.jax` enables JAX's
+global float64 mode, which the surrogate arithmetic requires.
+
+```python
+from gwsurrogate.jax import NRSur7dq4JAX
+
+sur = NRSur7dq4JAX()   # uses the standard NRSur7dq4.h5 download location
+
+# Same call conventions as the NumPy/C implementation (first call JIT-compiles)
+t, h, dyn = sur(q, chiA, chiB, dt=dt, f_low=0, precessing_opts=precessing_opts)
+
+# Batched evaluation over many parameter sets (B, n_modes, n_times)
+import numpy as np
+h_batch = sur.eval_modes_batch(np.array([1.5, 2.0, 3.0]),
+                               np.tile(chiA, (3, 1)),
+                               np.tile(chiB, (3, 1)))
+```
+
+The JAX implementation matches the NumPy/C implementation to
+~1e-10 of the peak strain amplitude (validated extensively in
+`test/jax_port/`). Currently `f_low` must be 0 (full surrogate length);
+`f_ref`, physical (mks) units, `inclination`/`phi_ref` mode summation,
+and `return_dynamics` are supported.
+
+
 ## PyCBC Integration
 
 You can also evaluate any gwsurrogate model through PyCBC’s waveform API.

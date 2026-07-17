@@ -76,6 +76,7 @@ setup(
     packages=[
         "gwsurrogate",
         "gwsurrogate.eval_pysur",
+        "gwsurrogate.jax",
         "gwsurrogate.new",
         # "gwsurrogate.precessing_utils",
         "gwsurrogate.spline_interp_Cwrapper",
