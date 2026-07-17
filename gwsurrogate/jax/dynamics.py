@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 
 from . import fits as jax_fits
+from . import quaternions as jax_quaternions
 
 
 def get_ds_fit_x(y, q):
@@ -151,3 +152,90 @@ def dynamics_rhs_at_node(dynamics_data, node_index, q, y):
         dynamics_data.fit_bf_orders[node_index],
         fit_params)  # (9,)
     return assemble_dydt(y, fit_values)
+
+
+def integrate_dynamics_from_start(dynamics_data, q, chiA0, chiB0,
+                                  init_quat=None, init_orbphase=0.0):
+    """Integrate the precession dynamics from the first time node (i0 = 0).
+
+    Port of the ``i0 == 0`` branch of ``DynamicsSurrogate.__call__``
+    (precessing_surrogate.py:461): three RK4 bootstrap steps over the
+    paired half-step nodes (``_initial_RK4`` :542) followed by variable-step
+    AB4 over the remaining nodes (``_integrate_forward`` :607), expressed as
+    a ``lax.scan``.
+
+    Arguments:
+        dynamics_data: DynamicsData pytree (padded fit tables and grids).
+        q: mass ratio (scalar, may be traced).
+        chiA0, chiB0: reference-time spins, shape (3,), in the coorbital
+            frame convention of the reference implementation.
+        init_quat: initial coprecessing-frame quaternion, shape (4,);
+            identity if None.
+        init_orbphase: initial orbital phase in the coprecessing frame.
+
+    Returns y_of_t with shape (n_dyn, 11) on the ``t_dynamics`` grid
+    (n_dyn = len(t_ds) - 3).
+    """
+    # Rotate spins from the lalsimulation source frame into the surrogate
+    # frame (DynamicsSurrogate.__call__ :431).
+    chiA0 = jax_quaternions.rotate_spin(chiA0, -1 * init_orbphase)
+    chiB0 = jax_quaternions.rotate_spin(chiB0, -1 * init_orbphase)
+    norm_chiA = jnp.sqrt(jnp.sum(chiA0**2))
+    norm_chiB = jnp.sqrt(jnp.sum(chiB0**2))
+
+    if init_quat is None:
+        init_quat = jnp.array([1.0, 0.0, 0.0, 0.0])
+    y0 = jnp.concatenate([init_quat,
+                          jnp.asarray(init_orbphase, dtype=jnp.float64)[None],
+                          chiA0, chiB0])
+
+    t_ds = dynamics_data.t_ds
+
+    # --- RK4 bootstrap: 3 steps over the paired half-step nodes ---
+    bootstrap_states = [y0]
+    bootstrap_k1 = []
+    bootstrap_full_dts = []
+    y = y0
+    for i in range(3):
+        half_dt = t_ds[2 * i + 1] - t_ds[2 * i]  # diff_t[2*i]
+        k1 = dynamics_rhs_at_node(dynamics_data, 2 * i, q, y)
+        k2 = dynamics_rhs_at_node(dynamics_data, 2 * i + 1, q,
+                                  y + half_dt * k1)
+        k3 = dynamics_rhs_at_node(dynamics_data, 2 * i + 1, q,
+                                  y + half_dt * k2)
+        k4 = dynamics_rhs_at_node(dynamics_data, 2 * i + 2, q,
+                                  y + 2 * half_dt * k3)
+        y_next = y + (half_dt / 3.) * (k1 + 2 * k2 + 2 * k3 + k4)
+        y = normalize_y(y_next, norm_chiA, norm_chiB)
+        bootstrap_states.append(y)
+        bootstrap_k1.append(k1)
+        bootstrap_full_dts.append(2 * half_dt)
+
+    # --- AB4 main loop as a scan over the remaining nodes ---
+    # At output index i (starting from 3), k4 is the RHS at t_ds node i + 3
+    # and the step is diff_t[i + 3] (_integrate_forward :625).
+    k4_node_indices = jnp.arange(6, len(dynamics_data.t_ds) - 1)
+    dt4_values = t_ds[7:] - t_ds[6:-1]  # diff_t[6:]
+
+    def ab4_step(carry, step_inputs):
+        y, k1, k2, k3, dt1, dt2, dt3 = carry
+        node_index, dt4 = step_inputs
+        k4 = dynamics_rhs_at_node(dynamics_data, node_index, q, y)
+        y_next = y + ab4_dy(k1, k2, k3, k4, dt1, dt2, dt3, dt4)
+        y_new = normalize_y(y_next, norm_chiA, norm_chiB)
+        return (y_new, k2, k3, k4, dt2, dt3, dt4), y_new
+
+    initial_carry = (y, bootstrap_k1[0], bootstrap_k1[1], bootstrap_k1[2],
+                     bootstrap_full_dts[0], bootstrap_full_dts[1],
+                     bootstrap_full_dts[2])
+    _, scanned_states = jax.lax.scan(
+        ab4_step, initial_carry, (k4_node_indices, dt4_values))
+
+    return jnp.concatenate(
+        [jnp.stack(bootstrap_states), scanned_states], axis=0)
+
+
+def unpack_dynamics_state(y_of_t):
+    """Split y_of_t (n_dyn, 11) into the reference return layout:
+    quat (4, n_dyn), orbphase (n_dyn,), chiA_copr / chiB_copr (n_dyn, 3)."""
+    return (y_of_t[:, 0:4].T, y_of_t[:, 4], y_of_t[:, 5:8], y_of_t[:, 8:11])

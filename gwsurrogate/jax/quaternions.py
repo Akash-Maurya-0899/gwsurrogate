@@ -48,6 +48,22 @@ def transform_time_dependent_vector(quat, vec):
     return multiply_quats(quat, multiply_quats(vec_as_quat, q_inv))[1:]
 
 
+def rotate_spin(chi, phase):
+    """Rotate spin vectors about the z axis by ``phase``.
+
+    Port of ``rotate_spin`` (precessing_surrogate.py:817), used for
+    transforming spins between the coprecessing and coorbital frames.
+    chi has shape (..., 3); phase is a scalar or matches chi's leading
+    dimensions.
+    """
+    sin_phase = jnp.sin(phase)
+    cos_phase = jnp.cos(phase)
+    return jnp.stack([
+        chi[..., 0] * cos_phase + chi[..., 1] * sin_phase,
+        chi[..., 1] * cos_phase - chi[..., 0] * sin_phase,
+        chi[..., 2]], axis=-1)
+
+
 def _complex_unit_power_table(unit_phase, max_power):
     """Powers p = -max_power..max_power of a unit-modulus complex array.
 
