@@ -29,6 +29,8 @@ from typing import NamedTuple
 import h5py
 import numpy as np
 
+from . import spline as jax_spline
+
 # Order of the 9 dynamics fits per time node, matching the reference
 # fit_data_batch list (precessing_surrogate.py, DynamicsSurrogate.__init__).
 DYNAMICS_FIT_NAMES = (
@@ -75,10 +77,22 @@ class CoorbitalData(NamedTuple):
     ei_basis: np.ndarray           # (n_comp, N, n_coorb), zero-padded rows
 
 
+class SplineData(NamedTuple):
+    """Precomputed natural-spline operators for the model grids."""
+    # Dense operator interpolating any series from the dynamics output grid
+    # (t_dynamics, 230 nodes) onto the coorbital grid (t_coorb, 2000).
+    dynamics_to_coorb_matrix: np.ndarray
+    # Knot geometry for resampling from t_dynamics / t_coorb onto arbitrary
+    # user time grids.
+    t_dynamics_grid: jax_spline.SplineGridData
+    t_coorb_grid: jax_spline.SplineGridData
+
+
 class NRSur7dq4Data(NamedTuple):
     """All NRSur7dq4 model data needed by the JAX evaluation pipeline."""
     dynamics: DynamicsData
     coorb: CoorbitalData
+    spline: SplineData
 
 
 def default_nrsur7dq4_h5_path():
@@ -225,10 +239,20 @@ def load_nrsur7dq4_jax_data(h5_path=None, ell_max=4, to_device=True):
             "gwsurrogate.catalog.pull('NRSur7dq4') or pass h5_path." % h5_path)
 
     with h5py.File(h5_path, "r") as h5file:
-        data = NRSur7dq4Data(
-            dynamics=_load_dynamics_data(h5file),
-            coorb=_load_coorbital_data(h5file, ell_max),
-        )
+        dynamics_data = _load_dynamics_data(h5file)
+        coorbital_data = _load_coorbital_data(h5file, ell_max)
+
+    spline_data = SplineData(
+        dynamics_to_coorb_matrix=
+            jax_spline.build_natural_spline_interpolation_matrix(
+                dynamics_data.t_dynamics, coorbital_data.t_coorb),
+        t_dynamics_grid=jax_spline.make_spline_grid_data(
+            dynamics_data.t_dynamics),
+        t_coorb_grid=jax_spline.make_spline_grid_data(
+            coorbital_data.t_coorb),
+    )
+    data = NRSur7dq4Data(dynamics=dynamics_data, coorb=coorbital_data,
+                         spline=spline_data)
 
     _validate_padding_invariants(data)
 

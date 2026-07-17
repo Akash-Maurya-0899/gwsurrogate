@@ -64,12 +64,12 @@ def test_dense_interpolation_matrix_matches_c():
 
 def test_jnp_fixed_grid_real_matches_c():
     data_x, _, out_x = _random_grid_and_data(101, 500, seed=42)
-    fixed_grid = jax_spline.NaturalSplineFixedGrid(data_x)
+    fixed_grid = jax_spline.make_spline_grid_data(data_x)
     rng = np.random.default_rng(43)
     many_y = rng.standard_normal((7, len(data_x)))
 
     reference = _splinterp_Cwrapper_many(out_x, data_x, many_y)
-    ours = np.asarray(fixed_grid.interpolate(jnp.asarray(many_y),
+    ours = np.asarray(jax_spline.spline_interpolate(fixed_grid, jnp.asarray(many_y),
                                              jnp.asarray(out_x)))
     np.testing.assert_allclose(ours, reference, rtol=RTOL,
                                atol=ATOL_REAL_FMA)
@@ -77,22 +77,22 @@ def test_jnp_fixed_grid_real_matches_c():
 
 def test_jnp_fixed_grid_complex_matches_c():
     data_x, _, out_x = _random_grid_and_data(101, 500, seed=44)
-    fixed_grid = jax_spline.NaturalSplineFixedGrid(data_x)
+    fixed_grid = jax_spline.make_spline_grid_data(data_x)
     rng = np.random.default_rng(45)
     many_y = rng.standard_normal((5, len(data_x))) \
         + 1j * rng.standard_normal((5, len(data_x)))
 
     reference = _splinterp_Cwrapper_many_complex(out_x, data_x, many_y)
-    ours = np.asarray(fixed_grid.interpolate(jnp.asarray(many_y),
+    ours = np.asarray(jax_spline.spline_interpolate(fixed_grid, jnp.asarray(many_y),
                                              jnp.asarray(out_x)))
     np.testing.assert_allclose(ours, reference, rtol=RTOL, atol=ATOL)
 
 
 def test_jnp_single_dataset_shape():
     data_x, data_y, out_x = _random_grid_and_data(50, 120, seed=46)
-    fixed_grid = jax_spline.NaturalSplineFixedGrid(data_x)
+    fixed_grid = jax_spline.make_spline_grid_data(data_x)
     reference = _splinterp_Cwrapper(out_x, data_x, data_y)
-    ours = np.asarray(fixed_grid.interpolate(jnp.asarray(data_y),
+    ours = np.asarray(jax_spline.spline_interpolate(fixed_grid, jnp.asarray(data_y),
                                              jnp.asarray(out_x)))
     assert ours.shape == (len(out_x),)
     np.testing.assert_allclose(ours, reference, rtol=RTOL, atol=ATOL)
@@ -106,8 +106,8 @@ def test_full_range_matches_scipy_natural_spline():
     out_x = np.sort(rng.uniform(data_x[0], data_x[-1], 500))
 
     scipy_values = CubicSpline(data_x, data_y, bc_type="natural")(out_x)
-    fixed_grid = jax_spline.NaturalSplineFixedGrid(data_x)
-    ours = np.asarray(fixed_grid.interpolate(jnp.asarray(data_y),
+    fixed_grid = jax_spline.make_spline_grid_data(data_x)
+    ours = np.asarray(jax_spline.spline_interpolate(fixed_grid, jnp.asarray(data_y),
                                              jnp.asarray(out_x)))
     np.testing.assert_allclose(ours, scipy_values, rtol=1e-12, atol=1e-12)
 
@@ -120,7 +120,7 @@ def test_full_range_matches_scipy_natural_spline():
 def test_evaluation_at_knots_is_exact():
     """Interpolating onto the knots must reproduce the data (near-exactly)."""
     data_x, data_y, _ = _random_grid_and_data(80, 10, seed=47)
-    fixed_grid = jax_spline.NaturalSplineFixedGrid(data_x)
-    ours = np.asarray(fixed_grid.interpolate(jnp.asarray(data_y),
+    fixed_grid = jax_spline.make_spline_grid_data(data_x)
+    ours = np.asarray(jax_spline.spline_interpolate(fixed_grid, jnp.asarray(data_y),
                                              jnp.asarray(data_x)))
     np.testing.assert_allclose(ours, data_y, rtol=0.0, atol=1e-13)

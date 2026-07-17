@@ -23,3 +23,7 @@ except ImportError as e:
 
 # Must be set before any JAX arrays are created anywhere in this subpackage.
 jax.config.update("jax_enable_x64", True)
+
+from .surrogate import NRSur7dq4JAX  # noqa: E402
+
+__all__ = ["NRSur7dq4JAX"]

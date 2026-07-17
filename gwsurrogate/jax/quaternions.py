@@ -237,10 +237,11 @@ def wigner_d_matrices(quat, ell_max=4):
     is_general = ~(ra_is_zero | rb_is_zero)
 
     # --- General case, with masked-out points made numerically safe ---
-    c = jnp.sqrt(abs_ra_sqr)  # |ra|
-    s = jnp.sqrt(abs_rb_sqr)  # |rb|
-    safe_c = jnp.where(is_general, c, 1.0)
-    safe_s = jnp.where(is_general, s, 1.0)
+    # The squared magnitudes are guarded BEFORE the sqrt: edge-case points
+    # (|ra| ~ 0 or |rb| ~ 0) would otherwise poison gradients through the
+    # masked branch (d/dx sqrt(0) = inf, and inf * 0 = NaN in the vjp).
+    safe_c = jnp.sqrt(jnp.where(is_general, abs_ra_sqr, 1.0))  # |ra|
+    safe_s = jnp.sqrt(jnp.where(is_general, abs_rb_sqr, 1.0))  # |rb|
     unit_phase_a = ra / safe_c
     unit_phase_b = rb / safe_s
 

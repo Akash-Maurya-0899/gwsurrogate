@@ -1,0 +1,328 @@
+"""User-facing JAX evaluator for the NRSur7dq4 precessing surrogate.
+
+Port of ``PrecessingSurrogate.__call__``
+(gwsurrogate/new/precessing_surrogate.py:922) restricted, for now, to
+fM_ref = None/0 and fM_low = None/0 (dynamics start at the first surrogate
+time node; full reference-frequency support is a later milestone).
+
+The numerical pipeline is fully jitted and vmap-able:
+
+    dynamics (RK4 bootstrap + AB4 scan on the t_ds grid)
+      -> natural-spline resample onto the coorbital grid (dense matmul)
+      -> quaternion/spin renormalization, coprecessing -> coorbital spins
+      -> coorbital-frame modes (EI-node fits + EI-basis contraction)
+      -> inertial-frame rotation (Wigner-D)
+      -> optional natural-spline resample onto a user time grid
+
+Usage::
+
+    from gwsurrogate.jax import NRSur7dq4JAX
+    surrogate = NRSur7dq4JAX()
+    t, h, dynamics = surrogate(q, chiA0, chiB0, f_low=0)
+    h_batch = surrogate.eval_modes_batch(q_array, chiA0_array, chiB0_array)
+
+Note: each distinct user time-grid length triggers one jit recompilation
+(static output shapes); reuse grids of the same length to avoid it.
+"""
+
+import functools
+
+import numpy as np
+import jax
+import jax.numpy as jnp
+
+from . import coorb as jax_coorb
+from . import data as jax_data
+from . import dynamics as jax_dynamics
+from . import quaternions as jax_quaternions
+from . import spline as jax_spline
+
+_IDENTITY_QUATERNION = np.array([1.0, 0.0, 0.0, 0.0])
+
+
+def _normalize_spin_series(chi, chi_norm):
+    """Rescale each spin vector of a time series to magnitude chi_norm.
+
+    Port of ``normalize_spin`` (precessing_surrogate.py:849), with the
+    host-side ``if chi_norm > 0`` guard replaced by double-``where`` so a
+    traced zero norm stays exactly zero without NaNs.
+    """
+    current_norm = jnp.sqrt(jnp.sum(chi**2, axis=1))
+    safe_norm = jnp.where(current_norm > 0.0, current_norm, 1.0)
+    scale = jnp.where(current_norm > 0.0, chi_norm / safe_norm, 1.0)
+    return chi * scale[:, None]
+
+
+def _evaluate_dimensionless_modes(data, q, chiA0, chiB0, init_quat,
+                                  init_orbphase, ell_max):
+    """Modes on the coorbital time grid, plus dynamics for reuse.
+
+    Port of the fM_ref=None, fM_low=None path of
+    ``PrecessingSurrogate.__call__`` (precessing_surrogate.py:1016-1067).
+
+    Returns (h_inertial (n_modes, n_coorb) complex,
+             dynamics_on_coorb = (quat (4, n_coorb), orbphase (n_coorb,),
+                                  chiA_copr, chiB_copr (n_coorb, 3)),
+             y_of_t (n_dyn, 11) on the dynamics grid).
+    """
+    chiA_norm = jnp.sqrt(jnp.sum(chiA0**2))
+    chiB_norm = jnp.sqrt(jnp.sum(chiB0**2))
+
+    y_of_t = jax_dynamics.integrate_dynamics_from_start(
+        data.dynamics, q, chiA0, chiB0, init_quat=init_quat,
+        init_orbphase=init_orbphase)
+
+    # Natural-spline resample of all dynamics series onto t_coorb via the
+    # precomputed dense operator (linear in the data; __call__ :1049-1056).
+    interpolation_matrix = data.spline.dynamics_to_coorb_matrix
+    chiA_copr = interpolation_matrix @ y_of_t[:, 5:8]    # (n_coorb, 3)
+    chiB_copr = interpolation_matrix @ y_of_t[:, 8:11]
+    orbphase = interpolation_matrix @ y_of_t[:, 4]
+    quat = (interpolation_matrix @ y_of_t[:, 0:4]).T     # (4, n_coorb)
+
+    chiA_copr = _normalize_spin_series(chiA_copr, chiA_norm)
+    chiB_copr = _normalize_spin_series(chiB_copr, chiB_norm)
+    quat = quat / jnp.sqrt(jnp.sum(quat * quat, axis=0))
+
+    # Coorbital-frame spins (coorb_spins_from_copr_spins :827).
+    chiA_coorb = jax_quaternions.rotate_spin(chiA_copr, orbphase)
+    chiB_coorb = jax_quaternions.rotate_spin(chiB_copr, orbphase)
+
+    h_coorb = jax_coorb.coorbital_waveform_modes(
+        data.coorb, q, chiA_coorb, chiB_coorb, ell_max=ell_max)
+
+    # Coorbital -> inertial frame (inertial_waveform_modes :832).
+    orbphase_quat = jnp.stack([
+        jnp.cos(orbphase / 2.), jnp.zeros_like(orbphase),
+        jnp.zeros_like(orbphase), jnp.sin(orbphase / 2.)])
+    full_quat = jax_quaternions.multiply_quats(quat, orbphase_quat)
+    h_inertial = jax_quaternions.rotate_waveform(full_quat, h_coorb,
+                                                 ell_max=ell_max)
+
+    return h_inertial, (quat, orbphase, chiA_copr, chiB_copr), y_of_t
+
+
+def _resample_modes(data, h_inertial, timesM):
+    """Natural-spline resample of the mode array onto a user time grid."""
+    return jax_spline.spline_interpolate(data.spline.t_coorb_grid,
+                                         h_inertial, timesM)
+
+
+def _dynamics_on_times(data, y_of_t, chiA_norm, chiB_norm, timesM):
+    """Dynamics quantities resampled from the dynamics grid onto timesM.
+
+    Mirrors the return_dynamics interpolation of ``__call__`` :1113-1124
+    (interpolate from the sparse dynamics grid, then renormalize).
+    """
+    grid = data.spline.t_dynamics_grid
+    series = jnp.concatenate([y_of_t[:, 0:4], y_of_t[:, 4:5],
+                              y_of_t[:, 5:8], y_of_t[:, 8:11]], axis=1).T
+    resampled = jax_spline.spline_interpolate(grid, series, timesM)
+    quat = resampled[0:4]
+    orbphase = resampled[4]
+    chiA_copr = _normalize_spin_series(resampled[5:8].T, chiA_norm)
+    chiB_copr = _normalize_spin_series(resampled[8:11].T, chiB_norm)
+    quat = quat / jnp.sqrt(jnp.sum(quat * quat, axis=0))
+    return quat, orbphase, chiA_copr, chiB_copr
+
+
+def _inertial_spins(quat, chiA_copr, chiB_copr):
+    """Inertial-frame spins from coprecessing spins (__call__ :1126)."""
+    chiA_inertial = jax_quaternions.transform_time_dependent_vector(
+        quat, chiA_copr.T).T
+    chiB_inertial = jax_quaternions.transform_time_dependent_vector(
+        quat, chiB_copr.T).T
+    return chiA_inertial, chiB_inertial
+
+
+class NRSur7dq4JAX:
+    """JAX implementation of the NRSur7dq4 precessing surrogate.
+
+    Dimensionless evaluation only (physical units are a later milestone).
+    Supports f_low = 0/None and f_ref = 0/None; other values raise
+    NotImplementedError until the reference-frequency milestone lands.
+
+    The heavy pipeline is jit-compiled on first use (per ellMax and per
+    distinct user time-grid length) and evaluated in float64.
+    """
+
+    def __init__(self, h5_path=None):
+        self.data = jax_data.load_nrsur7dq4_jax_data(h5_path)
+        self.t_coorb = np.asarray(self.data.coorb.t_coorb)
+        self.ell_max_model = 4
+
+        self._eval_modes = jax.jit(
+            _evaluate_dimensionless_modes, static_argnames=("ell_max",))
+        # vmap maps keyword arguments over axis 0 (in_axes only covers
+        # positionals), so ell_max must be bound statically BEFORE vmap;
+        # one compiled batch function is cached per ell_max value.
+        self._eval_modes_batch_cache = {}
+        self._resample_modes = jax.jit(_resample_modes)
+        self._resample_modes_batch = jax.jit(
+            jax.vmap(_resample_modes, in_axes=(None, 0, None)))
+        self._dynamics_on_times = jax.jit(_dynamics_on_times)
+        self._inertial_spins = jax.jit(_inertial_spins)
+
+    def _batched_mode_evaluator(self, ell_max):
+        if ell_max not in self._eval_modes_batch_cache:
+            bound = functools.partial(_evaluate_dimensionless_modes,
+                                      ell_max=ell_max)
+            self._eval_modes_batch_cache[ell_max] = jax.jit(
+                jax.vmap(bound, in_axes=(None, 0, 0, 0, 0, 0)))
+        return self._eval_modes_batch_cache[ell_max]
+
+    def _validate_inputs(self, q, chiA0, chiB0, f_low, f_ref, ellMax):
+        if f_low not in (None, 0, 0.0):
+            raise NotImplementedError(
+                "NRSur7dq4JAX currently supports only f_low=0 (full "
+                "surrogate length); use the NumPy/C implementation for "
+                "f_low > 0.")
+        if f_ref not in (None, 0, 0.0):
+            raise NotImplementedError(
+                "NRSur7dq4JAX currently supports only f_ref=None/0 "
+                "(reference epoch at the start of the surrogate data).")
+        if ellMax is not None and not 2 <= ellMax <= self.ell_max_model:
+            raise ValueError("ellMax must be in 2..%d." % self.ell_max_model)
+
+        q = np.atleast_1d(np.asarray(q, dtype=np.float64))
+        chiA0 = np.asarray(chiA0, dtype=np.float64)
+        chiB0 = np.asarray(chiB0, dtype=np.float64)
+        if np.any(q < 0.99):
+            raise ValueError("Mass ratio q must be >= 1.")
+        for name, chi in (("chiA0", chiA0), ("chiB0", chiB0)):
+            norms = np.sqrt(np.sum(np.atleast_2d(chi)**2, axis=-1))
+            if np.any(norms > 1.001):
+                raise ValueError("%s has magnitude > 1." % name)
+        if np.any(q > 6.01):
+            raise ValueError("q=%s outside the hard limit q <= 6." % q)
+
+    def _prepare_times(self, dt, times):
+        """Uniform grid from dt, or validated user times (host-side).
+
+        Mirrors ``__call__`` :1069-1096 with t0 = t_coorb[0] (f_low=0).
+        """
+        if dt is not None and times is not None:
+            raise ValueError("Specify at most one of dt and times.")
+        if dt is not None:
+            t0 = self.t_coorb[0]
+            tf = self.t_coorb[-1]
+            num_times = int(np.ceil((tf - t0) / dt))
+            return t0 + dt * np.arange(num_times)
+        if times is not None:
+            times = np.asarray(times, dtype=np.float64)
+            if times[-1] > self.t_coorb[-1] + 0.01:
+                raise ValueError("'times' includes times larger than the "
+                                 "maximum time value in domain.")
+            if times[0] < self.t_coorb[0]:
+                raise ValueError("'times' starts before start of domain.")
+            return times
+        return None
+
+    def __call__(self, q, chiA0, chiB0, f_low=None, f_ref=None, dt=None,
+                 times=None, ellMax=None, precessing_opts=None):
+        """Evaluate dimensionless inertial-frame modes h_lm(t).
+
+        Arguments mirror the dimensionless subset of
+        ``SurrogateEvaluator.__call__`` (gwsurrogate/surrogate.py:1721):
+        q, chiA0, chiB0 are the mass ratio and reference-epoch spins
+        (lalsimulation conventions); f_low/f_ref must be 0/None for now;
+        dt or times select an output grid (default: the coorbital grid);
+        ellMax limits the modes; precessing_opts supports 'init_orbphase',
+        'init_quat' and 'return_dynamics'.
+
+        Returns (times, h, dynamics) where h maps (ell, m) -> complex
+        time series and dynamics is None unless return_dynamics is set.
+        """
+        precessing_opts = dict(precessing_opts or {})
+        init_orbphase = precessing_opts.pop("init_orbphase", 0.0) or 0.0
+        init_quat = precessing_opts.pop("init_quat", None)
+        return_dynamics = precessing_opts.pop("return_dynamics", False)
+        if precessing_opts:
+            raise ValueError("Unused keys in precessing_opts: %s"
+                             % sorted(precessing_opts))
+
+        self._validate_inputs(q, chiA0, chiB0, f_low, f_ref, ellMax)
+        ell_max = self.ell_max_model if ellMax is None else ellMax
+        if init_quat is None:
+            init_quat = _IDENTITY_QUATERNION
+
+        q = float(np.asarray(q).reshape(()))
+        chiA0 = jnp.asarray(chiA0, dtype=jnp.float64)
+        chiB0 = jnp.asarray(chiB0, dtype=jnp.float64)
+        init_quat = jnp.asarray(init_quat, dtype=jnp.float64)
+        init_orbphase = jnp.asarray(init_orbphase, dtype=jnp.float64)
+
+        h_inertial, dynamics_on_coorb, y_of_t = self._eval_modes(
+            self.data, q, chiA0, chiB0, init_quat, init_orbphase,
+            ell_max=ell_max)
+
+        output_times = self._prepare_times(dt, times)
+        if output_times is None:
+            output_times = np.copy(self.t_coorb)
+        else:
+            h_inertial = self._resample_modes(
+                self.data, h_inertial, jnp.asarray(output_times))
+
+        h_array = np.asarray(h_inertial)
+        h = {}
+        mode_index = 0
+        for ell in range(2, ell_max + 1):
+            for m in range(-ell, ell + 1):
+                h[(ell, m)] = h_array[mode_index]
+                mode_index += 1
+
+        dynamics = None
+        if return_dynamics:
+            if times is None and dt is None:
+                quat, orbphase, chiA_copr, chiB_copr = dynamics_on_coorb
+            else:
+                chiA_norm = jnp.sqrt(jnp.sum(chiA0**2))
+                chiB_norm = jnp.sqrt(jnp.sum(chiB0**2))
+                quat, orbphase, chiA_copr, chiB_copr = \
+                    self._dynamics_on_times(self.data, y_of_t, chiA_norm,
+                                            chiB_norm,
+                                            jnp.asarray(output_times))
+            chiA_inertial, chiB_inertial = self._inertial_spins(
+                quat, chiA_copr, chiB_copr)
+            dynamics = {
+                "chiA": np.asarray(chiA_inertial),
+                "chiB": np.asarray(chiB_inertial),
+                "chiA_copr": np.asarray(chiA_copr),
+                "chiB_copr": np.asarray(chiB_copr),
+                "q_copr": np.asarray(quat),
+                "orbphase": np.asarray(orbphase),
+            }
+
+        return output_times, h, dynamics
+
+    def eval_modes_batch(self, q, chiA0, chiB0, ellMax=None, times=None):
+        """Batched dimensionless mode evaluation via jit(vmap(...)).
+
+        Arguments:
+            q: (B,) mass ratios.
+            chiA0, chiB0: (B, 3) reference-epoch spins.
+            ellMax: largest ell (static; default 4).
+            times: optional shared output time grid, 1D.
+
+        Returns a complex array with shape (B, n_modes, T) where modes are
+        ordered (2,-2)..(2,2), (3,-3)..(3,3), ... and T is len(times) or
+        the coorbital grid length.
+        """
+        self._validate_inputs(q, chiA0, chiB0, None, None, ellMax)
+        ell_max = self.ell_max_model if ellMax is None else ellMax
+
+        q = jnp.asarray(q, dtype=jnp.float64)
+        chiA0 = jnp.asarray(chiA0, dtype=jnp.float64)
+        chiB0 = jnp.asarray(chiB0, dtype=jnp.float64)
+        batch_size = q.shape[0]
+        init_quat = jnp.broadcast_to(jnp.asarray(_IDENTITY_QUATERNION),
+                                     (batch_size, 4))
+        init_orbphase = jnp.zeros(batch_size)
+
+        h_inertial, _, _ = self._batched_mode_evaluator(ell_max)(
+            self.data, q, chiA0, chiB0, init_quat, init_orbphase)
+        if times is not None:
+            output_times = self._prepare_times(None, times)
+            h_inertial = self._resample_modes_batch(
+                self.data, h_inertial, jnp.asarray(output_times))
+        return h_inertial

@@ -21,6 +21,8 @@ Two paths are provided:
    instead).
 """
 
+from typing import NamedTuple
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -128,99 +130,105 @@ def build_natural_spline_interpolation_matrix(data_x, out_x):
         _second_derivatives_numpy(data_x, identity), np.asarray(out_x))
 
 
-class NaturalSplineFixedGrid:
-    """Precomputed knot geometry for jnp interpolation from a fixed grid.
+class SplineGridData(NamedTuple):
+    """Precomputed knot geometry of a fixed source grid (a JAX pytree).
 
-    Holds NumPy arrays (h, inv_h, factored diagonal, Thomas factors) for a
-    fixed source grid, so per-call jnp work is only the two scans (in the
-    data) and the pointwise evaluation.
+    Per-call jnp work is then only the two Thomas sweeps (in the data) and
+    the pointwise evaluation.
     """
+    knots: np.ndarray             # (n,)
+    h: np.ndarray                 # (n-1,) interval widths
+    inv_h: np.ndarray             # (n-1,) reciprocals
+    diag: np.ndarray              # (n-2,) factored interior diagonal
+    forward_factors: np.ndarray   # (n-3,) h[k]/diag[k-1] for the sweep
 
-    def __init__(self, data_x):
-        data_x = np.asarray(data_x, dtype=np.float64)
-        h, inv_h, diag = _thomas_factors(data_x)
-        self.data_x = data_x
-        self.h = h
-        self.inv_h = inv_h
-        self.diag = diag
-        # factor[k] = h[k] / diag[k-1] for k = 1..n-3 (forward sweep)
-        self.forward_factors = h[1:len(diag)] / diag[:-1]
 
-    def second_derivatives(self, data_y):
-        """Natural-spline second derivatives of data_y (jnp; scans).
+def make_spline_grid_data(data_x):
+    """Build SplineGridData for a fixed knot grid (NumPy, load time)."""
+    data_x = np.asarray(data_x, dtype=np.float64)
+    h, inv_h, diag = _thomas_factors(data_x)
+    return SplineGridData(
+        knots=data_x, h=h, inv_h=inv_h, diag=diag,
+        forward_factors=h[1:len(diag)] / diag[:-1])
 
-        data_y has shape (n,) or (D, n) (datasets leading, matching the
-        multi-dataset C API); the scans carry all datasets at once.
-        """
-        y = jnp.asarray(data_y)
-        squeeze = (y.ndim == 1)
-        if squeeze:
-            y = y[None, :]
 
-        inv_h = jnp.asarray(self.inv_h)
-        h = jnp.asarray(self.h)
-        diag = jnp.asarray(self.diag)
-        forward_factors = jnp.asarray(self.forward_factors)
+def spline_second_derivatives(grid, data_y):
+    """Natural-spline second derivatives of data_y (jnp; scans).
 
-        raw = 6.0 * (y[:, 2:] * inv_h[1:]
-                     - y[:, 1:-1] * (inv_h[1:] + inv_h[:-1])
-                     + y[:, :-2] * inv_h[:-1])  # (D, n-2)
+    data_y has shape (n,) or (D, n) (datasets leading, matching the
+    multi-dataset C API); the scans carry all datasets at once.
+    """
+    y = jnp.asarray(data_y)
+    squeeze = (y.ndim == 1)
+    if squeeze:
+        y = y[None, :]
 
-        def forward_sweep(rhs_prev, inputs):
-            raw_k, factor_k = inputs
-            rhs_k = raw_k - factor_k * rhs_prev
-            return rhs_k, rhs_k
+    inv_h = jnp.asarray(grid.inv_h)
+    h = jnp.asarray(grid.h)
+    diag = jnp.asarray(grid.diag)
 
-        _, rhs_rest = jax.lax.scan(
-            forward_sweep, raw[:, 0],
-            (raw[:, 1:].T, forward_factors))
-        rhs = jnp.concatenate([raw[:, :1], rhs_rest.T], axis=1)  # (D, n-2)
+    raw = 6.0 * (y[:, 2:] * inv_h[1:]
+                 - y[:, 1:-1] * (inv_h[1:] + inv_h[:-1])
+                 + y[:, :-2] * inv_h[:-1])  # (D, n-2)
 
-        def backward_sweep(c_next, inputs):
-            rhs_k, h_k1, diag_k = inputs
-            c_k = (rhs_k - h_k1 * c_next) / diag_k
-            return c_k, c_k
+    def forward_sweep(rhs_prev, inputs):
+        raw_k, factor_k = inputs
+        rhs_k = raw_k - factor_k * rhs_prev
+        return rhs_k, rhs_k
 
-        c_last_interior = rhs[:, -1] / diag[-1]
-        num_interior = rhs.shape[1]
-        _, c_rest = jax.lax.scan(
-            backward_sweep, c_last_interior,
-            (rhs[:, :-1].T[::-1], h[1:num_interior][::-1],
-             diag[:-1][::-1]))
-        c_interior = jnp.concatenate(
-            [c_rest[::-1].T, c_last_interior[:, None]], axis=1)
+    _, rhs_rest = jax.lax.scan(
+        forward_sweep, raw[:, 0],
+        (raw[:, 1:].T, jnp.asarray(grid.forward_factors)))
+    rhs = jnp.concatenate([raw[:, :1], rhs_rest.T], axis=1)  # (D, n-2)
 
-        zeros = jnp.zeros_like(c_interior[:, :1])
-        c = jnp.concatenate([zeros, c_interior, zeros], axis=1)  # (D, n)
-        return c[0] if squeeze else c
+    def backward_sweep(c_next, inputs):
+        rhs_k, h_k1, diag_k = inputs
+        c_k = (rhs_k - h_k1 * c_next) / diag_k
+        return c_k, c_k
 
-    def evaluate(self, data_y, second_derivs, out_x):
-        """Piecewise-cubic Horner evaluation at out_x (jnp).
+    c_last_interior = rhs[:, -1] / diag[-1]
+    num_interior = rhs.shape[1]
+    _, c_rest = jax.lax.scan(
+        backward_sweep, c_last_interior,
+        (rhs[:, :-1].T[::-1], h[1:num_interior][::-1],
+         diag[:-1][::-1]))
+    c_interior = jnp.concatenate(
+        [c_rest[::-1].T, c_last_interior[:, None]], axis=1)
 
-        data_y/second_derivs have shape (n,) or (D, n); out_x is 1D (may be
-        traced). Out-of-range points are clamped to the end intervals.
-        """
-        y = jnp.asarray(data_y)
-        c = jnp.asarray(second_derivs)
-        squeeze = (y.ndim == 1)
-        if squeeze:
-            y, c = y[None, :], c[None, :]
+    zeros = jnp.zeros_like(c_interior[:, :1])
+    c = jnp.concatenate([zeros, c_interior, zeros], axis=1)  # (D, n)
+    return c[0] if squeeze else c
 
-        data_x = jnp.asarray(self.data_x)
-        idx = jnp.clip(jnp.searchsorted(data_x, out_x, side="right") - 1,
-                       0, len(self.data_x) - 2)
-        t = out_x - data_x[idx]
-        inv_hi = jnp.asarray(self.inv_h)[idx]
-        hi = jnp.asarray(self.h)[idx]
 
-        ci = c[:, idx]
-        ci1 = c[:, idx + 1]
-        d_coeff = (ci1 - ci) * inv_hi * (1.0 / 6.0)
-        b = -hi * (1.0 / 6.0) * (2.0 * ci + ci1) \
-            + (y[:, idx + 1] - y[:, idx]) * inv_hi
-        result = y[:, idx] + t * (b + t * (0.5 * ci + t * d_coeff))
-        return result[0] if squeeze else result
+def spline_evaluate(grid, data_y, second_derivs, out_x):
+    """Piecewise-cubic Horner evaluation at out_x (jnp).
 
-    def interpolate(self, data_y, out_x):
-        """Full natural-spline resample of data_y onto out_x (jnp)."""
-        return self.evaluate(data_y, self.second_derivatives(data_y), out_x)
+    data_y/second_derivs have shape (n,) or (D, n); out_x is 1D (may be
+    traced). Out-of-range points are clamped to the end intervals.
+    """
+    y = jnp.asarray(data_y)
+    c = jnp.asarray(second_derivs)
+    squeeze = (y.ndim == 1)
+    if squeeze:
+        y, c = y[None, :], c[None, :]
+
+    knots = jnp.asarray(grid.knots)
+    idx = jnp.clip(jnp.searchsorted(knots, out_x, side="right") - 1,
+                   0, knots.shape[0] - 2)
+    t = out_x - knots[idx]
+    inv_hi = jnp.asarray(grid.inv_h)[idx]
+    hi = jnp.asarray(grid.h)[idx]
+
+    ci = c[:, idx]
+    ci1 = c[:, idx + 1]
+    d_coeff = (ci1 - ci) * inv_hi * (1.0 / 6.0)
+    b = -hi * (1.0 / 6.0) * (2.0 * ci + ci1) \
+        + (y[:, idx + 1] - y[:, idx]) * inv_hi
+    result = y[:, idx] + t * (b + t * (0.5 * ci + t * d_coeff))
+    return result[0] if squeeze else result
+
+
+def spline_interpolate(grid, data_y, out_x):
+    """Full natural-spline resample of data_y onto out_x (jnp)."""
+    return spline_evaluate(grid, data_y,
+                           spline_second_derivatives(grid, data_y), out_x)
