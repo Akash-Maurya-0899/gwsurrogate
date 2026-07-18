@@ -221,9 +221,14 @@ h_batch = sur.eval_modes_batch(np.array([1.5, 2.0, 3.0]),
 
 The JAX implementation matches the NumPy/C implementation to
 ~1e-10 of the peak strain amplitude (validated extensively in
-`test/jax_port/`). Currently `f_low` must be 0 (full surrogate length);
-`f_ref`, physical (mks) units, `inclination`/`phi_ref` mode summation,
-and `return_dynamics` are supported.
+`test/jax_port/`), with full feature parity: `f_low > 0` (low-frequency
+truncation), `f_ref`, physical (mks) units, `inclination`/`phi_ref` mode
+summation, and `return_dynamics` are all supported.
+
+A notebook-style tour of the JAX backend — JIT, batching, CPU/GPU,
+gradients in parameter space and along time, plus benchmarks against the
+NumPy/C backend — lives in `examples/nrsur7dq4_jax_demo.py` (convert with
+`jupytext --to ipynb examples/nrsur7dq4_jax_demo.py`).
 
 
 ## PyCBC Integration
