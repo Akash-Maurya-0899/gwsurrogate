@@ -155,7 +155,9 @@ def test_batch_matches_single(jax_surrogate):
 
 
 def test_unsupported_options_raise(jax_surrogate):
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError):
+        # f_low below the frequency at the first node (f_low > 0 itself
+        # is supported since M11; range violations still raise)
         jax_surrogate(2.0, np.zeros(3), np.zeros(3), f_low=0.001)
     with pytest.raises(ValueError):
         # f_ref far above omega_ref_max/pi

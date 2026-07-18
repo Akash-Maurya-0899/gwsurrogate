@@ -118,4 +118,7 @@ def test_get_fit_params_batched():
     rowwise = np.array([
         np.asarray(jax_fits.get_fit_params(jnp.asarray(row)))
         for row in x_batch])
-    assert (batched == rowwise).all()
+    # Not bitwise: XLA may fuse the affine map differently for the batched
+    # and per-row programs (observed: a single 1-ULP difference on the CPU
+    # backend, exact equality on GPU), so allow 1 ULP.
+    np.testing.assert_allclose(batched, rowwise, rtol=4e-16, atol=1e-16)
