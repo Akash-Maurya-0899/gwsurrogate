@@ -44,12 +44,16 @@ def _normalize_spin_series(chi, chi_norm):
     """Rescale each spin vector of a time series to magnitude chi_norm.
 
     Port of ``normalize_spin`` (precessing_surrogate.py:849), with the
-    host-side ``if chi_norm > 0`` guard replaced by double-``where`` so a
-    traced zero norm stays exactly zero without NaNs.
+    host-side ``if chi_norm > 0`` guard replaced by ``where`` guards so a
+    traced zero norm stays exactly zero without NaNs. The guard must sit
+    *inside* the sqrt: sqrt(0) in the primal has an infinite VJP, and even a
+    zero cotangent through it yields 0*inf = NaN under reverse-mode AD (hit
+    with exactly-zero spins, e.g. non-spinning gradient evaluations).
     """
-    current_norm = jnp.sqrt(jnp.sum(chi**2, axis=1))
-    safe_norm = jnp.where(current_norm > 0.0, current_norm, 1.0)
-    scale = jnp.where(current_norm > 0.0, chi_norm / safe_norm, 1.0)
+    norm_sq = jnp.sum(chi**2, axis=1)
+    nonzero = norm_sq > 0.0
+    safe_norm = jnp.sqrt(jnp.where(nonzero, norm_sq, 1.0))
+    scale = jnp.where(nonzero, chi_norm / safe_norm, 1.0)
     return chi * scale[:, None]
 
 
