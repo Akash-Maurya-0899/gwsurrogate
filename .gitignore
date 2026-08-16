@@ -13,3 +13,7 @@ surrogate_downloads
 build/
 dist/
 gwsurrogate.egg-info/
+
+# AI agent instruction files (local only, never publish)
+CLAUDE.md
+AGENTS.md
